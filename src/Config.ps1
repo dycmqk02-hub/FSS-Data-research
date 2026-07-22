@@ -1,4 +1,7 @@
-﻿# FSS 업무자료(공시/회계) 메뉴 매핑 테이블
+﻿# Invoke-WebRequest의 기본 진행률 표시(별도 팝업/창으로 뜸)를 끔 - 전 페이지를 순회하며 여러 번 호출할 때 방해됨
+$ProgressPreference = 'SilentlyContinue'
+
+# FSS 업무자료(공시/회계) 메뉴 매핑 테이블
 # Type: "bbs"  -> /fss/bbs/{BbsId}/list.do?menuNo={MenuNo}   (게시판형, Phase 1)
 #       "job"  -> /fss/job/{JobPath}/list.do?menuNo={MenuNo} (검색폼형, Phase 2)
 #       "info" -> 목록/첨부 없는 정보성 페이지 (스크래핑 대상 아님, 안내만 표시)

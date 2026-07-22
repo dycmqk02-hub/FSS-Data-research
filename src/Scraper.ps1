@@ -16,6 +16,12 @@ function Get-FssBoardList {
     $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
     $html = $resp.Content
 
+    # 페이지 하단 페이지네이션 위젯(예: <a ... data-pageindex='24'>끝 목록</a>)에 총 페이지 수가 이미 노출되어 있어서
+    # 진행률 계산용으로 파싱해 둠(전 페이지를 실제로 걷지 않고도 첫 페이지에서 총 페이지 수를 알 수 있음).
+    $script:LastListTotalPages = $null
+    $pageNums = [regex]::Matches($html, "data-pageindex='(\d+)'") | ForEach-Object { [int]$_.Groups[1].Value }
+    if ($pageNums) { $script:LastListTotalPages = ($pageNums | Measure-Object -Maximum).Maximum }
+
     $rows = New-Object System.Collections.Generic.List[object]
 
     # 게시글 제목/링크: <a href="/fss/bbs/{BbsId}/view.do?nttId=12345&...">제목</a>
@@ -40,6 +46,38 @@ function Get-FssBoardList {
     }
 
     return $rows
+}
+
+function Get-FssBoardAllItems {
+    # 게시판마다 서버 자체 검색(searchWrd/searchCnd) 구성이 달라 신뢰할 수 없으므로(예: 심사·감리지적사례는
+    # 제목이 아니라 쟁점분야/관련기준서/결정년도만 검색됨), 전 페이지를 가져와 호출부에서 제목으로 직접 필터링할 때 사용.
+    # $OnProgress -> & $OnProgress <현재페이지> <총페이지 또는 $null> <퍼센트(int) 또는 $null>
+    # $script:CancelRequested가 $true가 되면 중간에 중단하고 지금까지 모은 항목만 반환.
+    param(
+        [Parameter(Mandatory)] [string]$BbsId,
+        [Parameter(Mandatory)] [string]$MenuNo,
+        [string]$ExtraParams = "",
+        [scriptblock]$OnProgress = $null
+    )
+
+    $pageIndex = 1
+    $totalPages = $null
+    $allItems = New-Object System.Collections.Generic.List[object]
+    while ($true) {
+        if ($script:CancelRequested) { break }
+        $items = Get-FssBoardList -BbsId $BbsId -MenuNo $MenuNo -PageIndex $pageIndex -ExtraParams $ExtraParams
+        if ($pageIndex -eq 1 -and $script:LastListTotalPages) { $totalPages = $script:LastListTotalPages }
+        if ($items.Count -eq 0) { break }
+        foreach ($it in $items) { $allItems.Add($it) }
+        if ($OnProgress) {
+            $pct = if ($totalPages) { [Math]::Min(100, [int](($pageIndex / $totalPages) * 100)) } else { $null }
+            & $OnProgress $pageIndex $totalPages $pct
+        }
+        if ($items.Count -lt 10) { break }
+        $pageIndex++
+        if ($pageIndex -gt 300) { break }
+    }
+    return $allItems
 }
 
 function Get-FssBoardDetail {
@@ -155,6 +193,10 @@ function Get-FssJobListRows {
     $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
     $html = $resp.Content
 
+    $script:LastListTotalPages = $null
+    $pageNums = [regex]::Matches($html, "data-pageindex='(\d+)'") | ForEach-Object { [int]$_.Groups[1].Value }
+    if ($pageNums) { $script:LastListTotalPages = ($pageNums | Measure-Object -Maximum).Maximum }
+
     $rows = New-Object System.Collections.Generic.List[object]
 
     # accnutAdtorInfo형 목록 행: <td class="num">N</td><td><a href=".../view.do?...XxxSlno=123">제목</a></td> 이후 일반 <td>들 + 첨부파일(class="file-single")
@@ -200,6 +242,39 @@ function Get-FssJobListRows {
     }
 
     return $rows
+}
+
+function Get-FssJobAllListRows {
+    # Get-FssBoardAllItems와 동일한 이유(게시판별 서버 검색 신뢰 불가)로 전 페이지를 가져와
+    # 호출부에서 제목으로 직접 필터링할 때 사용. Sdate/Edate는 서버가 실제로 필터링하는 것으로
+    # 확인됐으므로(Phase 2 검증) 그대로 전달.
+    param(
+        [Parameter(Mandatory)] [string]$JobPath,
+        [Parameter(Mandatory)] [string]$MenuNo,
+        [string]$Sdate = "",
+        [string]$Edate = "",
+        [string]$ExtraParams = "",
+        [scriptblock]$OnProgress = $null
+    )
+
+    $pageIndex = 1
+    $totalPages = $null
+    $allRows = New-Object System.Collections.Generic.List[object]
+    while ($true) {
+        if ($script:CancelRequested) { break }
+        $rows = Get-FssJobListRows -JobPath $JobPath -MenuNo $MenuNo -PageIndex $pageIndex -Sdate $Sdate -Edate $Edate -ExtraParams $ExtraParams
+        if ($pageIndex -eq 1 -and $script:LastListTotalPages) { $totalPages = $script:LastListTotalPages }
+        if ($rows.Count -eq 0) { break }
+        foreach ($r in $rows) { $allRows.Add($r) }
+        if ($OnProgress) {
+            $pct = if ($totalPages) { [Math]::Min(100, [int](($pageIndex / $totalPages) * 100)) } else { $null }
+            & $OnProgress $pageIndex $totalPages $pct
+        }
+        if ($rows.Count -lt 10) { break }
+        $pageIndex++
+        if ($pageIndex -gt 300) { break }
+    }
+    return $allRows
 }
 
 function Save-FssJobSeries {
