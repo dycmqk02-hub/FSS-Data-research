@@ -80,20 +80,18 @@ function Get-FssBoardAllItems {
     return $allItems
 }
 
-function Get-FssBoardDetail {
+function ConvertFrom-FssDetailHtml {
+    # 상세페이지 HTML -> RegDate/Files/BodyText 파싱. 순수 함수(네트워크 호출/스크립트 스코프 의존 없음)로 만들어
+    # Get-FssBoardDetail과 Get-FssBoardBodiesParallel(병렬 본문조회, 별도 실행 스레드) 양쪽에서 재사용.
     param(
-        [Parameter(Mandatory)] [string]$BbsId,
-        [Parameter(Mandatory)] [string]$MenuNo,
-        [Parameter(Mandatory)] [string]$NttId
+        [Parameter(Mandatory)] [string]$Html,
+        [Parameter(Mandatory)] [string]$NttId,
+        [Parameter(Mandatory)] [string]$BaseUrl
     )
-
-    $url = "$script:FssBaseUrl/fss/bbs/$BbsId/view.do?nttId=$NttId&menuNo=$MenuNo"
-    $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
-    $html = $resp.Content
 
     # 등록일: 상세 페이지 내 '등록일' 레이블 뒤 날짜 패턴
     $regDate = ""
-    $dateMatch = [regex]::Match($html, '등록일[^0-9]{0,20}(\d{4}[-.]\d{2}[-.]\d{2})')
+    $dateMatch = [regex]::Match($Html, '등록일[^0-9]{0,20}(\d{4}[-.]\d{2}[-.]\d{2})')
     if ($dateMatch.Success) { $regDate = $dateMatch.Groups[1].Value }
 
     # 첨부파일: fileDown.do?menuNo=...&atchFileId=...&fileSn=...
@@ -108,14 +106,14 @@ function Get-FssBoardDetail {
     )
 
     foreach ($filePattern in $filePatterns) {
-        $fileMatches = [regex]::Matches($html, $filePattern)
+        $fileMatches = [regex]::Matches($Html, $filePattern)
         foreach ($fm in $fileMatches) {
             $key = "$($fm.Groups[2].Value)_$($fm.Groups[3].Value)"
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
 
             $relUrl = [System.Net.WebUtility]::HtmlDecode($fm.Groups[1].Value)
-            $downloadUrl = if ($relUrl -match '^https?://') { $relUrl } else { "$script:FssBaseUrl$relUrl" }
+            $downloadUrl = if ($relUrl -match '^https?://') { $relUrl } else { "$BaseUrl$relUrl" }
             $files.Add([PSCustomObject]@{
                 AtchFileId  = $fm.Groups[2].Value
                 FileSn      = $fm.Groups[3].Value
@@ -125,11 +123,100 @@ function Get-FssBoardDetail {
         }
     }
 
-    return [PSCustomObject]@{
-        NttId   = $NttId
-        RegDate = $regDate
-        Files   = $files
+    # 본문 텍스트: 게시글 본문은 <div class="dbdata">...</div> 안에 있고(실사이트 확인),
+    # 바로 뒤에 담당부서/문의 <dl>이 오는 게 일반적이라 그 지점까지를 본문으로 간주.
+    # 담당부서 블록이 없는 게시글(일부 정보성/짧은 글)은 그 다음 목록 버튼(class="btn-set")까지로 대체.
+    $bodyText = ""
+    $bodyMatch = [regex]::Match($Html, '<div class="dbdata">(.*?)<dl>\s*<dt>담당부서', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $bodyMatch.Success) {
+        $bodyMatch = [regex]::Match($Html, '<div class="dbdata">(.*?)<div class="btn-set"', [System.Text.RegularExpressions.RegexOptions]::Singleline)
     }
+    if ($bodyMatch.Success) {
+        $stripped = [regex]::Replace($bodyMatch.Groups[1].Value, '<[^>]+>', ' ')
+        $stripped = [System.Net.WebUtility]::HtmlDecode($stripped)
+        $bodyText = ([regex]::Replace($stripped, '\s+', ' ')).Trim()
+    }
+
+    return [PSCustomObject]@{
+        NttId    = $NttId
+        RegDate  = $regDate
+        Files    = $files
+        BodyText = $bodyText
+    }
+}
+
+function Get-FssBoardDetail {
+    param(
+        [Parameter(Mandatory)] [string]$BbsId,
+        [Parameter(Mandatory)] [string]$MenuNo,
+        [Parameter(Mandatory)] [string]$NttId
+    )
+
+    $url = "$script:FssBaseUrl/fss/bbs/$BbsId/view.do?nttId=$NttId&menuNo=$MenuNo"
+    $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
+    return ConvertFrom-FssDetailHtml -Html $resp.Content -NttId $NttId -BaseUrl $script:FssBaseUrl
+}
+
+function Get-FssBoardBodiesParallel {
+    # 검색어가 제목에 없는 게시글들의 "본문"까지 검색하려면 상세페이지를 건마다 조회해야 해서
+    # 순차 처리하면 게시판 하나(수백 건)당 수십 초~수 분이 걸림. HttpClient 비동기 요청을
+    # 동시에 여러 건(기본 8개) 진행시켜 시간을 단축. 파싱은 가벼운 정규식이라 메인 스레드에서
+    # 완료된 요청을 폴링하며 처리(별도 러너스페이스/스레드 없이 WinForms STA 스레드 안에서 안전하게 동작).
+    # 반환: "{BbsId}_{NttId}" -> (ConvertFrom-FssDetailHtml 결과) 해시테이블. 일부 항목이 실패해도
+    # 나머지는 그대로 반환(본문검색은 최선노력이므로 개별 실패가 전체를 막지 않음).
+    param(
+        [Parameter(Mandatory)] [object[]]$Items,   # 각 항목: BbsId, MenuNo, NttId
+        [int]$MaxConcurrent = 8,
+        [scriptblock]$OnProgress = $null
+    )
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+
+    $results = @{}
+    if ($Items.Count -eq 0) { return $results }
+
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
+
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    foreach ($it in $Items) { $queue.Enqueue($it) }
+    $inFlight = New-Object System.Collections.Generic.List[object]
+    $completed = 0
+    $total = $Items.Count
+
+    try {
+        while ($queue.Count -gt 0 -or $inFlight.Count -gt 0) {
+            if ($script:CancelRequested) { break }
+            while ($inFlight.Count -lt $MaxConcurrent -and $queue.Count -gt 0) {
+                $it = $queue.Dequeue()
+                $url = "$script:FssBaseUrl/fss/bbs/$($it.BbsId)/view.do?nttId=$($it.NttId)&menuNo=$($it.MenuNo)"
+                $task = $client.GetStringAsync($url)
+                $inFlight.Add([PSCustomObject]@{ Item = $it; Task = $task })
+            }
+            Start-Sleep -Milliseconds 30
+            for ($i = $inFlight.Count - 1; $i -ge 0; $i--) {
+                $ent = $inFlight[$i]
+                if ($ent.Task.IsCompleted) {
+                    $inFlight.RemoveAt($i)
+                    $completed++
+                    if (-not $ent.Task.IsFaulted -and -not $ent.Task.IsCanceled) {
+                        try {
+                            $html = $ent.Task.GetAwaiter().GetResult()
+                            $detail = ConvertFrom-FssDetailHtml -Html $html -NttId $ent.Item.NttId -BaseUrl $script:FssBaseUrl
+                            $results["$($ent.Item.BbsId)_$($ent.Item.NttId)"] = $detail
+                        } catch {
+                            # 개별 항목 파싱 실패 - 건너뜀
+                        }
+                    }
+                    if ($OnProgress) { & $OnProgress $completed $total ([int](($completed / [Math]::Max(1, $total)) * 100)) }
+                }
+            }
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } finally {
+        $client.Dispose()
+    }
+    return $results
 }
 
 function Save-FssAttachment {

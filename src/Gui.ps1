@@ -192,7 +192,11 @@ function Show-FssGui {
     $btnNotifySettings.Left = 650; $btnNotifySettings.Top = 8; $btnNotifySettings.Width = 110; $btnNotifySettings.Height = 30
     $btnNotifySettings.Text = "알림 설정"
 
-    $btnPanel.Controls.AddRange(@($btnDownloadSelected, $btnDownloadSeries, $chkPdf, $btnNotifySettings))
+    $btnAiSettings = New-Object System.Windows.Forms.Button
+    $btnAiSettings.Left = 770; $btnAiSettings.Top = 8; $btnAiSettings.Width = 110; $btnAiSettings.Height = 30
+    $btnAiSettings.Text = "AI 요약 설정"
+
+    $btnPanel.Controls.AddRange(@($btnDownloadSelected, $btnDownloadSeries, $chkPdf, $btnNotifySettings, $btnAiSettings))
 
     # ---- 로그 ----
     $txtLog = New-Object System.Windows.Forms.TextBox
@@ -209,9 +213,21 @@ function Show-FssGui {
     $grid.MultiSelect = $true
     $grid.AutoSizeColumnsMode = "Fill"
     $grid.Columns.Add("Title", "제목") | Out-Null
+    $grid.Columns.Add("Snippet", "본문 검색결과 미리보기") | Out-Null
+    $grid.Columns.Add("Summary", "AI 요약 (첨부파일)") | Out-Null
+    $btnColSummarize = New-Object System.Windows.Forms.DataGridViewButtonColumn
+    $btnColSummarize.Name = "SummarizeBtn"
+    $btnColSummarize.HeaderText = ""
+    $btnColSummarize.Text = "AI요약"
+    $btnColSummarize.UseColumnTextForButtonValue = $true
+    $btnColSummarize.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::None
+    $btnColSummarize.Width = 70
+    $grid.Columns.Add($btnColSummarize) | Out-Null
     $grid.Columns.Add("NttId", "관리번호") | Out-Null
     $grid.Columns["NttId"].Visible = $false
-    $grid.Columns["Title"].FillWeight = 100
+    $grid.Columns["Title"].FillWeight = 25
+    $grid.Columns["Snippet"].FillWeight = 35
+    $grid.Columns["Summary"].FillWeight = 40
     $grid.BackgroundColor = [System.Drawing.Color]::White
 
     $form.Controls.AddRange(@($tree, $topPanel, $btnPanel, $txtLog, $grid))
@@ -252,10 +268,29 @@ function Show-FssGui {
     $script:CurrentPage = 1
     $script:JobRowFiles = @{}
     $script:BoardCache = @{}
+    $script:DetailCache = @{}
+    $script:SummaryCache = @{}
+    $script:LastSearchKeyword = ""
     $script:AggregateEntries = $null
     $script:AggregateRowInfo = @{}
     $script:CancelRequested = $false
     $script:TreeLocked = $false
+
+    function Get-FssKeywordSnippet {
+        # 본문에서 검색어가 처음 등장한 위치 기준으로 미리보기 문자열을 만듦(하이라이트 렌더링용 원본 텍스트 유지).
+        # 그리드 컬럼 폭이 좁아 뒷부분이 잘려도 검색어 자체는 항상 보이도록, 앞쪽 문맥은 짧게(기본 8자)
+        # 잡고 검색어를 미리보기 맨 앞쪽에 오게 함(뒤쪽 문맥은 넉넉히 붙여도 어차피 잘리면 그만이라 상관없음).
+        param([string]$Text, [string]$Keyword, [int]$Before = 8, [int]$After = 60)
+        if (-not $Text) { return "" }
+        $idx = $Text.IndexOf($Keyword, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($idx -lt 0) { return "" }
+        $start = [Math]::Max(0, $idx - $Before)
+        $len = [Math]::Min($Text.Length - $start, $Keyword.Length + $Before + $After)
+        $snippet = $Text.Substring($start, $len)
+        if ($start -gt 0) { $snippet = "..." + $snippet }
+        if ($start + $len -lt $Text.Length) { $snippet = $snippet + "..." }
+        return $snippet
+    }
 
     function Start-FssBusy {
         # 조회 중 DoEvents()가 메시지 큐를 처리하면서 트리 클릭 등 다른 조작까지 받아버리면,
@@ -340,13 +375,15 @@ function Show-FssGui {
                     Stop-FssBusy
                     $script:BoardCache[$cacheKey] = $allRows
                 }
+                $script:LastSearchKeyword = $keyword
                 $filtered = if ($keyword) { @($allRows | Where-Object { $_.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }) } else { @($allRows) }
                 $totalPages = [Math]::Max(1, [Math]::Ceiling($filtered.Count / $pageSize))
                 if ($script:CurrentPage -gt $totalPages) { $script:CurrentPage = $totalPages }
                 $startIdx = ($script:CurrentPage - 1) * $pageSize
                 $rows = $filtered | Select-Object -Skip $startIdx -First $pageSize
                 foreach ($r in $rows) {
-                    $grid.Rows.Add($r.Title, $r.Slno) | Out-Null
+                    # 검색폼형(job/list) 게시판은 상세 본문 파싱을 아직 지원하지 않아 제목만 검색(Snippet은 항상 빈 값)
+                    $grid.Rows.Add($r.Title, "", "", $null, $r.Slno) | Out-Null
                     $script:JobRowFiles[$r.Slno] = $r.Files
                 }
                 $lblPage.Text = "$($script:CurrentPage)/$totalPages 페이지 (페이지당 ${pageSize}건 / 총 $($filtered.Count)건)"
@@ -365,30 +402,64 @@ function Show-FssGui {
         try {
             $extra = if ($entry.ExtraParams) { $entry.ExtraParams } else { "" }
             $cacheKey = "bbs_$($entry.BbsId)"
-            if ($script:BoardCache.ContainsKey($cacheKey)) {
-                $allItems = $script:BoardCache[$cacheKey]
-            } else {
+            $busyStarted = $false
+            if (-not $script:BoardCache.ContainsKey($cacheKey)) {
                 Write-Log "조회 중: $($entry.Name)"
                 Start-FssBusy
+                $busyStarted = $true
                 # 게시판별 서버 검색조건이 제각각이라 신뢰 불가(예: 심사·감리지적사례는 제목이 아니라
                 # 쟁점분야/관련기준서/결정년도만 검색됨) -> 전 페이지를 가져와 직접 페이지네이션/필터링
                 $allItems = Get-FssBoardAllItems -BbsId $entry.BbsId -MenuNo $entry.MenuNo -ExtraParams $extra -OnProgress { param($p, $t, $pct) Update-FssProgress $p $t $pct }
-                Stop-FssBusy
                 $script:BoardCache[$cacheKey] = $allItems
+            } else {
+                $allItems = $script:BoardCache[$cacheKey]
             }
-            $filtered = if ($keyword) { @($allItems | Where-Object { $_.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }) } else { @($allItems) }
-            $totalPages = [Math]::Max(1, [Math]::Ceiling($filtered.Count / $pageSize))
+
+            $script:LastSearchKeyword = $keyword
+            $resultRows = New-Object System.Collections.Generic.List[object]
+
+            if (-not $keyword) {
+                foreach ($it in $allItems) { $resultRows.Add([PSCustomObject]@{ Title = $it.Title; NttId = $it.NttId; Snippet = "" }) }
+            } else {
+                # 1단계: 제목에 검색어가 있는 항목(빠름, 추가 요청 불필요)
+                $titleMatchIds = @{}
+                foreach ($it in $allItems) {
+                    if ($it.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        $titleMatchIds[$it.NttId] = $true
+                        $resultRows.Add([PSCustomObject]@{ Title = $it.Title; NttId = $it.NttId; Snippet = "" })
+                    }
+                }
+                # 2단계: 제목엔 없지만 본문에 있을 수 있는 나머지 항목 - 상세페이지를 조회해야 하므로
+                # 이미 조회한 적 있는 건(DetailCache)은 재사용하고, 없는 건만 병렬로 새로 가져옴
+                $bodyCandidates = @($allItems | Where-Object { -not $titleMatchIds.ContainsKey($_.NttId) })
+                $toFetch = @($bodyCandidates | Where-Object { -not $script:DetailCache.ContainsKey("$($entry.BbsId)_$($_.NttId)") } | ForEach-Object { [PSCustomObject]@{ BbsId = $entry.BbsId; MenuNo = $entry.MenuNo; NttId = $_.NttId } })
+                if ($toFetch.Count -gt 0) {
+                    Write-Log "본문 검색 중: $($toFetch.Count)건 상세 조회..."
+                    if (-not $busyStarted) { Start-FssBusy; $busyStarted = $true }
+                    $fetched = Get-FssBoardBodiesParallel -Items $toFetch -OnProgress { param($c, $t, $pct) Update-FssProgress $c $t $pct }
+                    foreach ($kv in $fetched.GetEnumerator()) { $script:DetailCache[$kv.Key] = $kv.Value }
+                }
+                foreach ($it in $bodyCandidates) {
+                    $d = $script:DetailCache["$($entry.BbsId)_$($it.NttId)"]
+                    if ($d -and $d.BodyText -and $d.BodyText.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        $resultRows.Add([PSCustomObject]@{ Title = $it.Title; NttId = $it.NttId; Snippet = (Get-FssKeywordSnippet -Text $d.BodyText -Keyword $keyword) })
+                    }
+                }
+            }
+            if ($busyStarted) { Stop-FssBusy }
+
+            $totalPages = [Math]::Max(1, [Math]::Ceiling($resultRows.Count / $pageSize))
             if ($script:CurrentPage -gt $totalPages) { $script:CurrentPage = $totalPages }
             $startIdx = ($script:CurrentPage - 1) * $pageSize
-            $items = $filtered | Select-Object -Skip $startIdx -First $pageSize
-            foreach ($it in $items) {
-                $grid.Rows.Add($it.Title, $it.NttId) | Out-Null
+            $pageRows = $resultRows | Select-Object -Skip $startIdx -First $pageSize
+            foreach ($row in $pageRows) {
+                $grid.Rows.Add($row.Title, $row.Snippet, "", $null, $row.NttId) | Out-Null
             }
-            $lblPage.Text = "$($script:CurrentPage)/$totalPages 페이지 (페이지당 ${pageSize}건 / 총 $($filtered.Count)건)"
+            $lblPage.Text = "$($script:CurrentPage)/$totalPages 페이지 (페이지당 ${pageSize}건 / 총 $($resultRows.Count)건)"
             if ($keyword) {
-                Write-Log "검색 완료: 전체 $($allItems.Count)건 중 '$keyword' 포함 $($filtered.Count)건"
+                Write-Log "검색 완료: 전체 $($allItems.Count)건 중 제목/본문에 '$keyword' 포함 $($resultRows.Count)건"
             } else {
-                Write-Log "조회 완료: 총 $($filtered.Count)건"
+                Write-Log "조회 완료: 총 $($resultRows.Count)건"
             }
         } catch {
             Stop-FssBusy
@@ -408,6 +479,8 @@ function Show-FssGui {
         $script:JobRowFiles = @{}
         $script:AggregateRowInfo = @{}
         $keyword = $txtSearch.Text.Trim()
+
+        $script:LastSearchKeyword = $keyword
 
         if (-not $keyword) {
             $lblPage.Text = ""
@@ -435,11 +508,29 @@ function Show-FssGui {
                         $items = Get-FssBoardAllItems -BbsId $entry.BbsId -MenuNo $entry.MenuNo -ExtraParams $extra
                         $script:BoardCache[$cacheKey] = $items
                     }
+                    $titleMatchIds = @{}
                     foreach ($it in $items) {
                         if ($it.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            $titleMatchIds[$it.NttId] = $true
                             $key = "bbs_$($entry.BbsId)_$($it.NttId)"
                             $script:AggregateRowInfo[$key] = [PSCustomObject]@{ Entry = $entry; NttId = $it.NttId; IsJobList = $false }
-                            $allMatches.Add([PSCustomObject]@{ DisplayTitle = "$($entry.Group) > $($entry.Name) > $($it.Title)"; Key = $key })
+                            $allMatches.Add([PSCustomObject]@{ DisplayTitle = "$($entry.Group) > $($entry.Name) > $($it.Title)"; Key = $key; Snippet = "" })
+                        }
+                    }
+                    # 제목엔 없지만 본문에 있을 수 있는 나머지 - 상세페이지를 병렬로 조회(이미 캐시된 건 재사용)
+                    $bodyCandidates = @($items | Where-Object { -not $titleMatchIds.ContainsKey($_.NttId) })
+                    $toFetch = @($bodyCandidates | Where-Object { -not $script:DetailCache.ContainsKey("$($entry.BbsId)_$($_.NttId)") } | ForEach-Object { [PSCustomObject]@{ BbsId = $entry.BbsId; MenuNo = $entry.MenuNo; NttId = $_.NttId } })
+                    if ($toFetch.Count -gt 0) {
+                        Write-Log "  본문 검색 중 ($boardIndex/$totalBoards): $($entry.Name) - $($toFetch.Count)건 상세 조회..."
+                        $fetched = Get-FssBoardBodiesParallel -Items $toFetch
+                        foreach ($kv in $fetched.GetEnumerator()) { $script:DetailCache[$kv.Key] = $kv.Value }
+                    }
+                    foreach ($it in $bodyCandidates) {
+                        $d = $script:DetailCache["$($entry.BbsId)_$($it.NttId)"]
+                        if ($d -and $d.BodyText -and $d.BodyText.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            $key = "bbs_$($entry.BbsId)_$($it.NttId)"
+                            $script:AggregateRowInfo[$key] = [PSCustomObject]@{ Entry = $entry; NttId = $it.NttId; IsJobList = $false }
+                            $allMatches.Add([PSCustomObject]@{ DisplayTitle = "$($entry.Group) > $($entry.Name) > $($it.Title)"; Key = $key; Snippet = (Get-FssKeywordSnippet -Text $d.BodyText -Keyword $keyword) })
                         }
                     }
                 } elseif ($entry.Type -eq "job" -and $entry.SubType -eq "list") {
@@ -455,7 +546,7 @@ function Show-FssGui {
                         if ($r.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                             $key = "job_$($entry.JobPath)_$($r.Slno)"
                             $script:AggregateRowInfo[$key] = [PSCustomObject]@{ Entry = $entry; Slno = $r.Slno; Files = $r.Files; IsJobList = $true }
-                            $allMatches.Add([PSCustomObject]@{ DisplayTitle = "$($entry.Group) > $($entry.Name) > $($r.Title)"; Key = $key })
+                            $allMatches.Add([PSCustomObject]@{ DisplayTitle = "$($entry.Group) > $($entry.Name) > $($r.Title)"; Key = $key; Snippet = "" })
                         }
                     }
                 }
@@ -471,7 +562,7 @@ function Show-FssGui {
         $startIdx = ($script:CurrentPage - 1) * $pageSize
         $pageItems = $allMatches | Select-Object -Skip $startIdx -First $pageSize
         foreach ($m in $pageItems) {
-            $grid.Rows.Add($m.DisplayTitle, $m.Key) | Out-Null
+            $grid.Rows.Add($m.DisplayTitle, $m.Snippet, "", $null, $m.Key) | Out-Null
         }
         $lblPage.Text = "$($script:CurrentPage)/$totalPages 페이지 (페이지당 ${pageSize}건 / 총 $($allMatches.Count)건)"
         if ($script:CancelRequested) {
@@ -569,6 +660,57 @@ function Show-FssGui {
         Write-Log "다운로드 완료: $outDir"
     }
 
+    $grid.Add_CellPainting({
+        # 제목/본문미리보기 셀 안에서 검색어와 일치하는 부분만 노란색 음영 + 검정 글씨로 그려서
+        # 어디에 검색어가 있는지 한눈에 보이게 함. 검색어가 없거나 해당 셀에 검색어가 없으면
+        # $e.Handled를 건드리지 않고 그냥 반환해서 DataGridView 기본 렌더링이 그대로 동작하게 둠.
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $e.ColumnIndex -lt 0) { return }
+        $colName = $grid.Columns[$e.ColumnIndex].Name
+        if ($colName -ne "Title" -and $colName -ne "Snippet") { return }
+        $keyword = $script:LastSearchKeyword
+        if ([string]::IsNullOrEmpty($keyword)) { return }
+        $text = [string]$e.FormattedValue
+        if ([string]::IsNullOrEmpty($text)) { return }
+        $idx = $text.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($idx -lt 0) { return }
+
+        $parts = [System.Windows.Forms.DataGridViewPaintParts]([int][System.Windows.Forms.DataGridViewPaintParts]::Background -bor `
+            [int][System.Windows.Forms.DataGridViewPaintParts]::Border -bor `
+            [int][System.Windows.Forms.DataGridViewPaintParts]::Focus -bor `
+            [int][System.Windows.Forms.DataGridViewPaintParts]::SelectionBackground)
+        $e.Paint($e.ClipBounds, $parts)
+
+        $isSelected = (([int]$e.State -band [int][System.Windows.Forms.DataGridViewElementStates]::Selected) -ne 0)
+        $foreColor = if ($isSelected) { $e.CellStyle.SelectionForeColor } else { $e.CellStyle.ForeColor }
+        $font = $e.CellStyle.Font
+        $g = $e.Graphics
+        $bounds = $e.CellBounds
+        $y = $bounds.Top + [Math]::Max(0, [int](($bounds.Height - $font.Height) / 2))
+        $x = $bounds.Left + 2
+        $flags = [System.Windows.Forms.TextFormatFlags]::NoPadding -bor [System.Windows.Forms.TextFormatFlags]::SingleLine
+
+        $before = $text.Substring(0, $idx)
+        $match = $text.Substring($idx, $keyword.Length)
+        $after = $text.Substring($idx + $keyword.Length)
+        $measureSize = New-Object System.Drawing.Size(2000, 50)
+
+        $g.SetClip($bounds)
+        if ($before) {
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $before, $font, (New-Object System.Drawing.Point($x, $y)), $foreColor, $flags)
+            $x += [System.Windows.Forms.TextRenderer]::MeasureText($g, $before, $font, $measureSize, $flags).Width
+        }
+        $matchWidth = [System.Windows.Forms.TextRenderer]::MeasureText($g, $match, $font, $measureSize, $flags).Width
+        $g.FillRectangle([System.Drawing.Brushes]::Yellow, $x, $bounds.Top + 1, $matchWidth, $bounds.Height - 2)
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $match, $font, (New-Object System.Drawing.Point($x, $y)), [System.Drawing.Color]::Black, $flags)
+        $x += $matchWidth
+        if ($after) {
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $after, $font, (New-Object System.Drawing.Point($x, $y)), $foreColor, $flags)
+        }
+        $g.ResetClip()
+        $e.Handled = $true
+    })
+
     $grid.Add_CellDoubleClick({
         param($s, $e)
         if ($e.RowIndex -lt 0) { return }
@@ -585,7 +727,12 @@ function Show-FssGui {
                     $files = $info.Files
                     Show-FssItemPreview -Title $title -Files $files -ViewUrl $viewUrl -OnDownload { Invoke-FssFilesDownload -Files $files }
                 } else {
-                    $detail = Get-FssBoardDetail -BbsId $info.Entry.BbsId -MenuNo $info.Entry.MenuNo -NttId $info.NttId
+                    $detailKey = "$($info.Entry.BbsId)_$($info.NttId)"
+                    $detail = $script:DetailCache[$detailKey]
+                    if (-not $detail) {
+                        $detail = Get-FssBoardDetail -BbsId $info.Entry.BbsId -MenuNo $info.Entry.MenuNo -NttId $info.NttId
+                        $script:DetailCache[$detailKey] = $detail
+                    }
                     $viewUrl = "$script:FssBaseUrl/fss/bbs/$($info.Entry.BbsId)/view.do?nttId=$($info.NttId)&menuNo=$($info.Entry.MenuNo)"
                     $files = $detail.Files
                     Show-FssItemPreview -Title $title -RegDate $detail.RegDate -Files $files -ViewUrl $viewUrl -OnDownload { Invoke-FssFilesDownload -Files $files }
@@ -598,7 +745,12 @@ function Show-FssGui {
                     if ($entry.ExtraParams) { $viewUrl += "&$($entry.ExtraParams)" }
                     Show-FssItemPreview -Title $title -Files $files -ViewUrl $viewUrl -OnDownload { Invoke-FssFilesDownload -Files $files }
                 } elseif ($entry.Type -eq "bbs") {
-                    $detail = Get-FssBoardDetail -BbsId $entry.BbsId -MenuNo $entry.MenuNo -NttId $id
+                    $detailKey = "$($entry.BbsId)_$id"
+                    $detail = $script:DetailCache[$detailKey]
+                    if (-not $detail) {
+                        $detail = Get-FssBoardDetail -BbsId $entry.BbsId -MenuNo $entry.MenuNo -NttId $id
+                        $script:DetailCache[$detailKey] = $detail
+                    }
                     $viewUrl = "$script:FssBaseUrl/fss/bbs/$($entry.BbsId)/view.do?nttId=$id&menuNo=$($entry.MenuNo)"
                     $files = $detail.Files
                     Show-FssItemPreview -Title $title -RegDate $detail.RegDate -Files $files -ViewUrl $viewUrl -OnDownload { Invoke-FssFilesDownload -Files $files }
@@ -723,6 +875,137 @@ function Show-FssGui {
         Show-FssNotifySettings
     })
 
+    $btnAiSettings.Add_Click({
+        Show-FssAiSettings
+    })
+
+    $grid.Add_CellContentClick({
+        # 그리드의 "AI요약" 버튼(SummarizeBtn 컬럼) 클릭 시에만 동작. 온디맨드 호출이라 여기서 클릭될 때만
+        # Gemini API를 호출함(페이지 로드/검색으로는 절대 자동 호출되지 않음 - 비용 통제).
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $e.ColumnIndex -lt 0) { return }
+        if ($grid.Columns[$e.ColumnIndex].Name -ne "SummarizeBtn") { return }
+        $row = $grid.Rows[$e.RowIndex]
+        $id = $row.Cells["NttId"].Value
+
+        $files = $null
+        $summaryKey = $null
+        try {
+            if ($script:AggregateEntries) {
+                $info = $script:AggregateRowInfo[$id]
+                if (-not $info) { Write-Log "요약 대상 정보를 찾을 수 없습니다."; return }
+                if ($info.IsJobList) {
+                    $files = $info.Files
+                    $summaryKey = "job_$($info.Entry.JobPath)_$($info.Slno)"
+                } else {
+                    $detailKey = "$($info.Entry.BbsId)_$($info.NttId)"
+                    $detail = $script:DetailCache[$detailKey]
+                    if (-not $detail) {
+                        $detail = Get-FssBoardDetail -BbsId $info.Entry.BbsId -MenuNo $info.Entry.MenuNo -NttId $info.NttId
+                        $script:DetailCache[$detailKey] = $detail
+                    }
+                    $files = $detail.Files
+                    $summaryKey = $detailKey
+                }
+            } elseif ($script:CurrentEntry) {
+                $entry = $script:CurrentEntry
+                if ($entry.Type -eq "job" -and $entry.SubType -eq "list") {
+                    $files = $script:JobRowFiles[$id]
+                    $summaryKey = "job_$($entry.JobPath)_$id"
+                } elseif ($entry.Type -eq "bbs") {
+                    $detailKey = "$($entry.BbsId)_$id"
+                    $detail = $script:DetailCache[$detailKey]
+                    if (-not $detail) {
+                        $detail = Get-FssBoardDetail -BbsId $entry.BbsId -MenuNo $entry.MenuNo -NttId $id
+                        $script:DetailCache[$detailKey] = $detail
+                    }
+                    $files = $detail.Files
+                    $summaryKey = $detailKey
+                }
+            }
+        } catch {
+            $row.Cells["Summary"].Value = "요약 실패(첨부 조회): $($_.Exception.Message)"
+            return
+        }
+
+        if (-not $summaryKey) { Write-Log "요약할 게시글 정보를 찾을 수 없습니다."; return }
+
+        if ($script:SummaryCache.ContainsKey($summaryKey)) {
+            $row.Cells["Summary"].Value = $script:SummaryCache[$summaryKey]
+            return
+        }
+        if (-not $files -or $files.Count -eq 0) {
+            $row.Cells["Summary"].Value = "(첨부파일 없음)"
+            return
+        }
+        $hwpFiles = @($files | Where-Object { $_.FileName -match '\.hwp$' })
+        if ($hwpFiles.Count -eq 0) {
+            $row.Cells["Summary"].Value = "(HWP 첨부파일이 없어 요약 불가 - 현재 HWP만 지원)"
+            return
+        }
+        if (-not (Test-HwpInstalled)) {
+            $row.Cells["Summary"].Value = "(한컴오피스 미설치로 첨부파일 텍스트 추출 불가)"
+            return
+        }
+        $aiConfig = Get-FssAiConfig
+        if (-not $aiConfig.ApiKey) {
+            $row.Cells["Summary"].Value = "(API 키 미설정 - 'AI 요약 설정'에서 입력하세요)"
+            return
+        }
+
+        # 로컬에서 누적 집계한 오늘 사용량이 설정한 일일 한도의 90%를 넘으면 호출 자체를 막고 경고창을 띄움
+        # (구글 서버의 실시간 잔여 할당량을 조회하는 게 아니라 이 도구가 지금까지 호출한 만큼만 더한 추정치).
+        $usageBefore = Get-FssAiUsage
+        $budget = [int]$aiConfig.DailyTokenBudget
+        if ($budget -gt 0 -and $usageBefore.TokensUsed -ge [Math]::Floor($budget * 0.9)) {
+            $row.Cells["Summary"].Value = "(일일 토큰 한도 90% 도달로 요약 중지됨)"
+            [System.Windows.Forms.MessageBox]::Show(
+                "토큰이 모자랍니다.`r`n`r`nGemini API 오늘 누적 사용량이 설정한 일일 한도의 90%를 넘어 AI 요약 기능을 멈췄습니다.`r`n(오늘 사용량: $($usageBefore.TokensUsed) / 한도: $budget)`r`n`r`n이 값은 로컬 집계 추정치이며 자정에 초기화됩니다. 'AI 요약 설정'에서 한도를 조정할 수 있습니다.",
+                "토큰 한도 임박", "OK", "Warning") | Out-Null
+            return
+        }
+
+        $row.Cells["Summary"].Value = "요약 중..."
+        $grid.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+
+        try {
+            $tempDir = Join-Path $env:TEMP "FSS-DataTool-aitmp"
+            if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
+            $combinedText = New-Object System.Text.StringBuilder
+            foreach ($f in $hwpFiles) {
+                $saved = Save-FssAttachment -DownloadUrl $f.DownloadUrl -OutDir $tempDir -PreferredFileName $f.FileName
+                $extracted = Get-HwpPlainText -HwpPath $saved
+                if ($extracted) { [void]$combinedText.AppendLine($extracted) }
+                Remove-Item -Path $saved -Force -ErrorAction SilentlyContinue
+            }
+            $plainText = $combinedText.ToString().Trim()
+            if (-not $plainText) {
+                $row.Cells["Summary"].Value = "(첨부파일에서 텍스트를 추출하지 못했습니다)"
+                return
+            }
+            $result = Invoke-FssGeminiSummary -Text $plainText -ApiKey $aiConfig.ApiKey -Model $aiConfig.Model
+            if ($result.TokensUsed -gt 0) {
+                $usageAfter = Add-FssAiUsage -Tokens $result.TokensUsed
+                if ($budget -gt 0 -and $usageAfter.TokensUsed -ge [Math]::Floor($budget * 0.9) -and $usageAfter.TokensUsed - $result.TokensUsed -lt [Math]::Floor($budget * 0.9)) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "토큰이 모자랍니다.`r`n`r`n방금 호출로 오늘 누적 사용량이 일일 한도의 90%를 넘었습니다(오늘 사용량: $($usageAfter.TokensUsed) / 한도: $budget). 다음 요약 요청부터는 자동으로 중지됩니다.",
+                        "토큰 한도 임박", "OK", "Warning") | Out-Null
+                }
+            }
+            $script:SummaryCache[$summaryKey] = $result.Summary
+            $row.Cells["Summary"].Value = $result.Summary
+        } catch {
+            $errMsg = $_.Exception.Message
+            if ($errMsg -match '429|RESOURCE_EXHAUSTED|quota') {
+                $row.Cells["Summary"].Value = "(구글 무료 한도 초과 - 잠시 후 다시 시도하세요)"
+                [System.Windows.Forms.MessageBox]::Show("Gemini API가 무료 등급 요청 한도 초과(429) 응답을 반환했습니다. 잠시 후 다시 시도하거나 'AI 요약 설정'에서 한도/모델을 확인하세요.`r`n`r`n상세: $errMsg", "API 한도 초과", "OK", "Warning") | Out-Null
+            } else {
+                $row.Cells["Summary"].Value = "요약 실패: $errMsg"
+            }
+        }
+    })
+
     $form.Add_Shown({
         if ($script:FssDefaultItem) {
             foreach ($catNode in $tree.Nodes) {
@@ -769,6 +1052,75 @@ function Show-FssUnsavedChangesPrompt {
     $prompt.CancelButton = $btnCancelConfirm
 
     return $prompt.ShowDialog()
+}
+
+function Show-FssAiSettings {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "AI 요약 설정 (Google Gemini API)"
+    $dlg.ClientSize = New-Object System.Drawing.Size(480, 300)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+
+    $config = Get-FssAiConfig
+
+    $lblKey = New-Object System.Windows.Forms.Label
+    $lblKey.Left = 15; $lblKey.Top = 15; $lblKey.Width = 130
+    $lblKey.Text = "Gemini API 키:"
+    $txtKey = New-Object System.Windows.Forms.TextBox
+    $txtKey.Left = 150; $txtKey.Top = 12; $txtKey.Width = 315
+    $txtKey.PasswordChar = '*'
+    $txtKey.Text = $config.ApiKey
+
+    $lblModel = New-Object System.Windows.Forms.Label
+    $lblModel.Left = 15; $lblModel.Top = 48; $lblModel.Width = 130
+    $lblModel.Text = "모델 이름:"
+    $txtModel = New-Object System.Windows.Forms.TextBox
+    $txtModel.Left = 150; $txtModel.Top = 45; $txtModel.Width = 315
+    $txtModel.Text = $config.Model
+
+    $lblBudget = New-Object System.Windows.Forms.Label
+    $lblBudget.Left = 15; $lblBudget.Top = 81; $lblBudget.Width = 130
+    $lblBudget.Text = "일일 토큰 한도:"
+    $txtBudget = New-Object System.Windows.Forms.TextBox
+    $txtBudget.Left = 150; $txtBudget.Top = 78; $txtBudget.Width = 150
+    $txtBudget.Text = "$($config.DailyTokenBudget)"
+
+    $usage = Get-FssAiUsage
+    $lblUsage = New-Object System.Windows.Forms.Label
+    $lblUsage.Left = 15; $lblUsage.Top = 108; $lblUsage.Width = 450
+    $lblUsage.Text = "오늘($($usage.Date)) 누적 사용량: $($usage.TokensUsed) 토큰"
+
+    $lblHint = New-Object System.Windows.Forms.Label
+    $lblHint.Left = 15; $lblHint.Top = 136; $lblHint.Width = 450; $lblHint.Height = 150
+    $lblHint.Text = "API 키는 https://aistudio.google.com/apikey 에서 구글 계정으로 무료 발급 가능합니다.`r`n그리드의 'AI요약' 버튼을 누른 항목에 한해서만, 그 순간에만 API가 호출됩니다(자동 호출 없음).`r`n`r`n일일 토큰 한도는 이 도구가 로컬에서 누적 집계한 사용량과 비교하는 값이며(자정 기준 매일 초기화), 구글 서버의 실제 잔여 할당량을 실시간으로 조회하는 것은 아닙니다. 누적 사용량이 이 한도의 90%를 넘으면 요약 기능이 자동으로 멈추고 경고창이 뜹니다. 무료 등급의 실제 한도는 모델/시점마다 다르니 https://ai.google.dev/gemini-api/docs/rate-limits 에서 확인 후 이 값을 조정하세요.`r`n(무료 등급은 한도 초과 시 요청이 거부(오류)될 뿐 자동으로 유료 결제되지 않습니다 - 별도로 유료 결제를 연결한 경우만 과금됩니다.)"
+
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Left = 15; $btnSave.Top = 255; $btnSave.Width = 100; $btnSave.Height = 30
+    $btnSave.Text = "저장"
+    $btnSave.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Left = 125; $btnClose.Top = 255; $btnClose.Width = 100; $btnClose.Height = 30
+    $btnClose.Text = "닫기"
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $dlg.Controls.AddRange(@($lblKey, $txtKey, $lblModel, $txtModel, $lblBudget, $txtBudget, $lblUsage, $lblHint, $btnSave, $btnClose))
+    $dlg.AcceptButton = $btnSave
+    $dlg.CancelButton = $btnClose
+
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $budgetVal = 1000000
+        [void][int]::TryParse($txtBudget.Text.Trim(), [ref]$budgetVal)
+        if ($budgetVal -le 0) { $budgetVal = 1000000 }
+        $newConfig = [PSCustomObject]@{
+            ApiKey           = $txtKey.Text.Trim()
+            Model            = $(if ($txtModel.Text.Trim()) { $txtModel.Text.Trim() } else { "gemini-2.0-flash" })
+            DailyTokenBudget = $budgetVal
+        }
+        Save-FssAiConfig -Config $newConfig
+    }
 }
 
 function Show-FssNotifySettings {

@@ -15,7 +15,7 @@ Import-Module ps2exe -Force
 # 맨 앞에 param() 블록을 둬서 "-CheckOnly" 인자로 GUI 없이 알림 확인만 실행 가능하게 함(작업 스케줄러용).
 $mergedPath = Join-Path $env:TEMP "FSS-DataTool-merged.ps1"
 $paramBlock = "param([switch]`$CheckOnly)`n"
-$parts = @("Config.ps1", "Scraper.ps1", "Notify.ps1", "HwpConvert.ps1", "Gui.ps1") | ForEach-Object {
+$parts = @("Config.ps1", "Scraper.ps1", "Notify.ps1", "HwpConvert.ps1", "AiSummary.ps1", "Gui.ps1") | ForEach-Object {
     Get-Content -Path (Join-Path $srcDir $_) -Raw
 }
 $dispatch = "`nif (`$CheckOnly) { Invoke-FssNotificationCheck } else { Show-FssGui }`n"

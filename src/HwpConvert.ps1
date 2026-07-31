@@ -8,6 +8,37 @@
     return $false
 }
 
+function Get-HwpPlainText {
+    # HWP 본문을 일반 텍스트로 추출(AI 요약 입력용). 한컴오피스 COM의 GetTextFile("TEXT","") 사용.
+    # 미설치거나 추출 실패 시 $null 반환(호출부에서 안내 메시지 처리).
+    param([Parameter(Mandatory)] [string]$HwpPath)
+
+    if (-not (Test-HwpInstalled)) { return $null }
+
+    $hwp = $null
+    try {
+        $hwp = New-Object -ComObject HWPFrame.HwpObject
+        try {
+            $hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModuleExample")
+        } catch {}
+
+        $hwp.Open($HwpPath, "HWP", "")
+        $text = $hwp.GetTextFile("TEXT", "")
+        $hwp.Clear(1)
+        $hwp.Quit()
+        return $text
+    } catch {
+        try { if ($hwp) { $hwp.Quit() } } catch {}
+        return $null
+    } finally {
+        if ($hwp) {
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($hwp) | Out-Null
+        }
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
+}
+
 function Convert-HwpToPdf {
     param(
         [Parameter(Mandatory)] [string]$HwpPath,
