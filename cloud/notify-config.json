@@ -1,0 +1,36 @@
+{
+    "Enabled": true,
+    "SenderEmail": "dycmqk02@gmail.com",
+    "SmtpHost": "smtp.gmail.com",
+    "SmtpPort": 587,
+    "UseSsl": true,
+    "Recipients": [
+        "globalpicnic@naver.com",
+        "dycmqk02@gmail.com"
+    ],
+    "MonitoredKeys": [
+        "bbs_B0000145",
+        "bbs_B0000146",
+        "bbs_B0000147",
+        "bbs_B0000125",
+        "bbs_B0000126",
+        "bbs_B0000127",
+        "bbs_B0000128",
+        "bbs_B0000129",
+        "bbs_B0000130",
+        "bbs_B0000131",
+        "bbs_B0000132",
+        "bbs_B0000133",
+        "bbs_B0000134",
+        "bbs_B0000135",
+        "bbs_B0000136",
+        "bbs_B0000137",
+        "bbs_B0000291",
+        "job_accnutAdtorInfo",
+        "bbs_B0000142",
+        "bbs_B0000143",
+        "bbs_B0000144",
+        "bbs_B0000154",
+        "bbs_B0000156"
+    ]
+}
