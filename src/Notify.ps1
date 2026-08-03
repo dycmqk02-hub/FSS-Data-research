@@ -42,15 +42,17 @@ function Get-FssNotifiableMenus {
 function Get-FssNotifyConfig {
     $path = Get-FssNotifyConfigPath
     $default = [PSCustomObject]@{
-        Enabled       = $false
-        SenderEmail   = ""
-        AppPassword   = ""
-        SmtpHost      = "smtp.gmail.com"
-        SmtpPort      = 587
-        UseSsl        = $true
-        Recipients    = @()
-        MonitoredKeys = @()
-        IntervalHours = 24
+        Enabled          = $false
+        SenderEmail      = ""
+        AppPassword      = ""
+        SmtpHost         = "smtp.gmail.com"
+        SmtpPort         = 587
+        UseSsl           = $true
+        Recipients       = @()
+        MonitoredKeys    = @()
+        IntervalHours    = 24
+        TaskRegisteredAt = ""
+        TaskLastUpdatedAt = ""
     }
     if (-not (Test-Path $path)) { return $default }
 
@@ -245,23 +247,50 @@ function Register-FssNotifyTask {
 
     $taskName = Get-FssNotifyTaskName
     $psExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $action = "`"$psExe`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -CheckOnly"
+    $argList = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -CheckOnly"
+    $action = New-ScheduledTaskAction -Execute $psExe -Argument $argList
 
     if ($IntervalHours -ge 24) {
-        & schtasks.exe /Create /TN $taskName /TR $action /SC DAILY /ST 09:00 /F | Out-Null
+        $trigger = New-ScheduledTaskTrigger -Daily -At "09:00"
     } else {
-        & schtasks.exe /Create /TN $taskName /TR $action /SC HOURLY /MO $IntervalHours /F | Out-Null
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours(9) `
+            -RepetitionInterval (New-TimeSpan -Hours $IntervalHours) -RepetitionDuration ([TimeSpan]::MaxValue)
     }
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "작업 스케줄러 등록 실패(schtasks.exe 종료코드 $LASTEXITCODE)"
+    # 노트북이 배터리로 동작 중이거나(전원 미연결) 예약 시각에 컴퓨터가 꺼져/잠자기 상태였어도
+    # 확인이 조용히 건너뛰어지지 않도록 전원 관련 제약을 모두 해제.
+    # (예전엔 schtasks.exe 기본 설정으로 등록해서 "배터리 사용 중이면 시작 안 함"이 걸려있었고,
+    #  이 때문에 예약된 시각에 실행 자체가 거부되어(오류코드 0x800710E0) 알림 로그에
+    #  최초 테스트 이후로는 기록이 전혀 남지 않던 문제가 있었음 - StartWhenAvailable로
+    #  예약 시각을 놓쳐도 컴퓨터가 켜지면 바로 실행되도록 함께 보완)
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -DontStopOnIdleEnd `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+
+    try {
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+    } catch {
+        throw "작업 스케줄러 등록 실패: $($_.Exception.Message)"
     }
+
+    $nowStr = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $config = Get-FssNotifyConfig
+    if (-not $config.TaskRegisteredAt) { $config.TaskRegisteredAt = $nowStr }
+    $config.TaskLastUpdatedAt = $nowStr
+    Save-FssNotifyConfig -Config $config
+
     return $taskName
 }
 
 function Unregister-FssNotifyTask {
     $taskName = Get-FssNotifyTaskName
     & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+
+    $config = Get-FssNotifyConfig
+    $config.TaskRegisteredAt = ""
+    $config.TaskLastUpdatedAt = ""
+    Save-FssNotifyConfig -Config $config
 }
 
 function Test-FssNotifyTaskRegistered {

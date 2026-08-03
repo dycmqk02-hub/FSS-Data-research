@@ -72,9 +72,12 @@ function Show-FssGui {
     $form = New-Object System.Windows.Forms.Form
     $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $form.Text = "금융감독원 업무자료(공시/회계) 조회·다운로드"
-    $form.ClientSize = New-Object System.Drawing.Size(1080, 760)
+    # 하단 버튼 줄(선택 다운로드/시리즈 다운로드/HWP 변환 체크박스/알림 설정/AI 요약 설정)이
+    # 전부 겹치거나 잘리지 않고 한 줄에 들어가려면 최소 폭이 필요해서 기본/최소 창 폭을 넉넉히 잡음
+    # (트리 270 + 버튼 줄 최소 890 = 최소 1160 필요 — 1080이었을 때는 부족해서 계속 잘렸었음)
+    $form.ClientSize = New-Object System.Drawing.Size(1250, 760)
     $form.StartPosition = "CenterScreen"
-    $form.MinimumSize = New-Object System.Drawing.Size(760, 480)
+    $form.MinimumSize = New-Object System.Drawing.Size(1180, 480)
 
     # ---- 레이아웃 상수 ----
     $TREE_WIDTH = 270
@@ -189,11 +192,11 @@ function Show-FssGui {
     if (-not (Test-HwpInstalled)) { $chkPdf.Enabled = $false; $chkPdf.Text = "HWP→PDF 변환 (한글 미설치로 비활성)" }
 
     $btnNotifySettings = New-Object System.Windows.Forms.Button
-    $btnNotifySettings.Left = 650; $btnNotifySettings.Top = 8; $btnNotifySettings.Width = 110; $btnNotifySettings.Height = 30
+    $btnNotifySettings.Top = 8; $btnNotifySettings.Width = 110; $btnNotifySettings.Height = 30
     $btnNotifySettings.Text = "알림 설정"
 
     $btnAiSettings = New-Object System.Windows.Forms.Button
-    $btnAiSettings.Left = 770; $btnAiSettings.Top = 8; $btnAiSettings.Width = 110; $btnAiSettings.Height = 30
+    $btnAiSettings.Top = 8; $btnAiSettings.Width = 110; $btnAiSettings.Height = 30
     $btnAiSettings.Text = "AI 요약 설정"
 
     $btnPanel.Controls.AddRange(@($btnDownloadSelected, $btnDownloadSeries, $chkPdf, $btnNotifySettings, $btnAiSettings))
@@ -212,6 +215,7 @@ function Show-FssGui {
     $grid.SelectionMode = "FullRowSelect"
     $grid.MultiSelect = $true
     $grid.AutoSizeColumnsMode = "Fill"
+    $grid.ColumnHeadersDefaultCellStyle.Alignment = [System.Windows.Forms.DataGridViewContentAlignment]::MiddleCenter
     $grid.Columns.Add("Title", "제목") | Out-Null
     $grid.Columns.Add("Snippet", "본문 검색결과 미리보기") | Out-Null
     $grid.Columns.Add("Summary", "AI 요약 (첨부파일)") | Out-Null
@@ -225,6 +229,11 @@ function Show-FssGui {
     $grid.Columns.Add($btnColSummarize) | Out-Null
     $grid.Columns.Add("NttId", "관리번호") | Out-Null
     $grid.Columns["NttId"].Visible = $false
+    # 정렬(sort) 화살표 아이콘 공간이 열 오른쪽에 항상 예약되어 있어서, 정렬 기능을 안 쓰는데도
+    # 헤더 텍스트가 MiddleCenter여도 살짝 왼쪽으로 치우쳐 보임 -> 정렬을 꺼서 그 공간을 없앰
+    foreach ($colName in @("Title", "Snippet", "Summary", "NttId")) {
+        $grid.Columns[$colName].SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    }
     $grid.Columns["Title"].FillWeight = 25
     $grid.Columns["Snippet"].FillWeight = 35
     $grid.Columns["Summary"].FillWeight = 40
@@ -246,6 +255,22 @@ function Show-FssGui {
 
         $btnPanel.SetBounds($TREE_WIDTH, $TOP_HEIGHT + $gridHeight, $cw - $TREE_WIDTH, $BTNROW_HEIGHT)
         $txtLog.SetBounds($TREE_WIDTH, $TOP_HEIGHT + $gridHeight + $BTNROW_HEIGHT, $cw - $TREE_WIDTH, $LOG_HEIGHT)
+
+        # "알림 설정"/"AI 요약 설정" 버튼은 우측 끝에 고정 Left 값으로 두면 창 폭이 좁을 때
+        # 패널 밖으로 밀려나 잘리거나 왼쪽의 체크박스 문구와 겹쳐 보이므로, 매번 다시 계산함:
+        # 1) 기본은 패널 우측 끝에 붙임  2) 그래도 체크박스 영역과 겹치면 체크박스 바로 뒤로 밀어내고,
+        # 그만큼 AI요약 버튼도 같이 밀어서 둘 사이 간격은 항상 유지함(겹침 방지가 폭 확보보다 우선).
+        $gap = 10
+        $panelWidth = $btnPanel.Width
+        $aiLeft = [Math]::Max(0, $panelWidth - $gap - $btnAiSettings.Width)
+        $notifyLeft = $aiLeft - $gap - $btnNotifySettings.Width
+        $minNotifyLeft = $chkPdf.Left + $chkPdf.Width + $gap
+        if ($notifyLeft -lt $minNotifyLeft) {
+            $notifyLeft = $minNotifyLeft
+            $aiLeft = $notifyLeft + $btnNotifySettings.Width + $gap
+        }
+        $btnNotifySettings.Left = $notifyLeft
+        $btnAiSettings.Left = $aiLeft
 
         foreach ($c in @($tree, $topPanel, $grid, $btnPanel, $txtLog)) {
             $c.Invalidate()
@@ -1126,7 +1151,7 @@ function Show-FssAiSettings {
 function Show-FssNotifySettings {
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "알림 설정 (새 글 이메일 알림)"
-    $dlg.ClientSize = New-Object System.Drawing.Size(560, 620)
+    $dlg.ClientSize = New-Object System.Drawing.Size(600, 620)
     $dlg.StartPosition = "CenterParent"
     $dlg.FormBorderStyle = "FixedDialog"
     $dlg.MaximizeBox = $false
@@ -1217,9 +1242,21 @@ function Show-FssNotifySettings {
         $i++
     }
 
+    function Get-FssTaskStatusLabelText {
+        $cfg = Get-FssNotifyConfig
+        if (-not (Test-FssNotifyTaskRegistered)) { return "작업 스케줄러 등록 상태: 등록 안 됨" }
+        $parts = @()
+        if ($cfg.TaskRegisteredAt) { $parts += "등록일: $($cfg.TaskRegisteredAt.Substring(0, [Math]::Min(16, $cfg.TaskRegisteredAt.Length)))" }
+        if ($cfg.TaskLastUpdatedAt) {
+            $parts += "최종변경일: $($cfg.TaskLastUpdatedAt.Substring(0, [Math]::Min(16, $cfg.TaskLastUpdatedAt.Length)))"
+        }
+        $suffix = if ($parts.Count -gt 0) { "  ($($parts -join ' / '))" } else { "" }
+        return "작업 스케줄러 등록 상태: 등록됨$suffix"
+    }
+
     $lblTaskStatus = New-Object System.Windows.Forms.Label
-    $lblTaskStatus.Left = 15; $lblTaskStatus.Top = 466; $lblTaskStatus.Width = 525
-    $lblTaskStatus.Text = if (Test-FssNotifyTaskRegistered) { "작업 스케줄러 등록 상태: 등록됨" } else { "작업 스케줄러 등록 상태: 등록 안 됨" }
+    $lblTaskStatus.Left = 15; $lblTaskStatus.Top = 466; $lblTaskStatus.Width = 565
+    $lblTaskStatus.Text = Get-FssTaskStatusLabelText
 
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Left = 15; $btnSave.Top = 494; $btnSave.Width = 120; $btnSave.Height = 30
@@ -1354,7 +1391,7 @@ function Show-FssNotifySettings {
             if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
             Register-FssNotifyTask -ScriptPath $scriptPath -IntervalHours $newConfig.IntervalHours | Out-Null
-            $lblTaskStatus.Text = "작업 스케줄러 등록 상태: 등록됨"
+            $lblTaskStatus.Text = Get-FssTaskStatusLabelText
             Write-NotifyDlgLog "작업 스케줄러에 등록했습니다 ($($cboInterval.Text))."
         } catch {
             Write-NotifyDlgLog "등록 실패: $($_.Exception.Message)"
@@ -1364,7 +1401,7 @@ function Show-FssNotifySettings {
     $btnUnregisterTask.Add_Click({
         try {
             Unregister-FssNotifyTask
-            $lblTaskStatus.Text = "작업 스케줄러 등록 상태: 등록 안 됨"
+            $lblTaskStatus.Text = Get-FssTaskStatusLabelText
             Write-NotifyDlgLog "작업 스케줄러 등록을 해제했습니다."
         } catch {
             Write-NotifyDlgLog "해제 실패: $($_.Exception.Message)"
